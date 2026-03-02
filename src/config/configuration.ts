@@ -15,20 +15,37 @@ const parseList = (value?: string): string[] => {
 
 export default registerAs('config', () => ({
   environment: process.env.NODE_ENV || 'development',
+  
   service: {
     name: process.env.SERVICE_NAME || 'ads-service',
-    port: parseInt(process.env.PORT, 10) || 3001,
+    // 🔴 IMPORTANT: Railway sets PORT automatically, don't hardcode fallback
+    port: parseInt(process.env.PORT, 10) || 3000,
   },
+  
   cors: {
     origins: parseList(process.env.CORS_ORIGINS),
   },
+  
   mongodb: {
+    // 🔴 Make sure URI is required in production
     uri: process.env.MONGODB_URI,
   },
+  
   kafka: {
-    enabled: parseBoolean(process.env.ENABLE_KAFKA ?? 'true'),
-    brokers: (process.env.KAFKA_BROKERS || 'localhost:9092').split(','),
+    // 🔴 Set default to false for Railway (since Kafka isn't available by default)
+    enabled: parseBoolean(process.env.ENABLE_KAFKA ?? 'false'),
+    brokers: process.env.KAFKA_BROKERS 
+      ? process.env.KAFKA_BROKERS.split(',') 
+      : [], // Empty array when disabled
     clientId: process.env.KAFKA_CLIENT_ID || 'ads-service',
     groupId: process.env.KAFKA_GROUP_ID || 'ads-consumer-group',
+  },
+  
+  // 🔴 ADDED: JWT configuration (important for Railway)
+  jwt: {
+    secret: process.env.JWT_SECRET,
+    refreshSecret: process.env.JWT_REFRESH_SECRET,
+    expiresIn: process.env.JWT_EXPIRATION || '15m',
+    refreshExpiresIn: process.env.JWT_REFRESH_EXPIRATION || '7d',
   },
 }));
