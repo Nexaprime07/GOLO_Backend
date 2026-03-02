@@ -12,79 +12,118 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
     this.initializeKafkaClient();
   }
 
-  // private initializeKafkaClient() {
-  //   const kafkaConfig = this.configService.get('config.kafka');
-    
-  //   this.kafkaClient = new ClientKafka({
-  //     client: {
-  //       clientId: kafkaConfig.clientId,
-  //       brokers: kafkaConfig.brokers,
-  //       retry: {
-  //         initialRetryTime: 300,
-  //         retries: 8
-  //       }
-  //     },
-  //     consumer: {
-  //       groupId: kafkaConfig.groupId,
-  //       allowAutoTopicCreation: true,
-  //       maxBytesPerPartition: 1048576
-  //     },
-  //     producer: {
-  //       allowAutoTopicCreation: true,
-  //       transactionTimeout: 30000
-  //     }
-  //   });
-  // }
-
-
-  // src/kafka/kafka.service.ts
+  // ==================== INITIALIZATION WITH RAILWAY SUPPORT ====================
   private initializeKafkaClient() {
-  const kafkaConfig = this.configService.get('config.kafka');
-  
-  const options: any = {
-    client: {
-      clientId: kafkaConfig.clientId,
-      brokers: kafkaConfig.brokers,
-    },
-    consumer: {
-      groupId: kafkaConfig.groupId,
-    },
-    producer: {},
-  };
+    const kafkaConfig = this.configService.get('config.kafka');
+    
+    // Check if Kafka is enabled
+    if (!kafkaConfig?.enabled) {
+      this.logger.log('Kafka is disabled, skipping client initialization');
+      this.kafkaClient = null;
+      return;
+    }
 
-  // Add SASL authentication if configured
-  if (kafkaConfig.sasl) {
-    options.client.sasl = kafkaConfig.sasl;
-    options.client.ssl = false;
+    // Validate brokers
+    if (!kafkaConfig.brokers || kafkaConfig.brokers.length === 0) {
+      this.logger.error('Kafka is enabled but no brokers configured');
+      this.kafkaClient = null;
+      return;
+    }
+
+    const options: any = {
+      client: {
+        clientId: kafkaConfig.clientId,
+        brokers: kafkaConfig.brokers,
+        retry: {
+          initialRetryTime: 300,
+          retries: 8,
+          maxRetryTime: 30000,
+        },
+        connectionTimeout: 5000, // Add connection timeout
+        authenticationTimeout: 5000,
+      },
+      consumer: {
+        groupId: kafkaConfig.groupId,
+        allowAutoTopicCreation: true,
+        sessionTimeout: 30000,
+        rebalanceTimeout: 60000,
+      },
+      producer: {
+        allowAutoTopicCreation: true,
+        transactionTimeout: 30000,
+      },
+    };
+
+    // 🔴 IMPORTANT: Add SASL authentication for Railway
+    if (kafkaConfig.sasl?.username && kafkaConfig.sasl?.password) {
+      this.logger.log('Configuring SASL authentication for Railway Kafka');
+      options.client.sasl = {
+        mechanism: kafkaConfig.sasl.mechanism || 'plain',
+        username: kafkaConfig.sasl.username,
+        password: kafkaConfig.sasl.password,
+      };
+      options.client.ssl = false; // Railway uses plaintext internally
+    } else {
+      this.logger.warn('No SASL credentials provided for Kafka - connection may fail');
+    }
+
+    this.logger.log(`Kafka client initialized with brokers: ${kafkaConfig.brokers.join(', ')}`);
+    this.kafkaClient = new ClientKafka(options);
   }
 
-  this.kafkaClient = new ClientKafka(options);
-}
-
+  // ==================== LIFECYCLE HOOKS ====================
+  
   async onModuleInit() {
-    // Subscribe to response topics
-    const topics = [
-      KAFKA_TOPICS.AD_RESPONSE,
-      KAFKA_TOPICS.AD_ERROR,
-      KAFKA_TOPICS.AD_CREATED,
-      KAFKA_TOPICS.AD_UPDATED,
-      KAFKA_TOPICS.AD_DELETED
-    ];
+    // Skip if Kafka is disabled or client not initialized
+    if (!this.kafkaClient) {
+      this.logger.log('Kafka client not initialized, skipping connection');
+      return;
+    }
 
-    topics.forEach(topic => {
-      this.kafkaClient.subscribeToResponseOf(topic);
-    });
+    try {
+      // Subscribe to response topics
+      const topics = [
+        KAFKA_TOPICS.AD_RESPONSE,
+        KAFKA_TOPICS.AD_ERROR,
+        KAFKA_TOPICS.AD_CREATED,
+        KAFKA_TOPICS.AD_UPDATED,
+        KAFKA_TOPICS.AD_DELETED
+      ];
 
-    await this.kafkaClient.connect();
-    this.logger.log('Kafka client connected successfully');
+      topics.forEach(topic => {
+        this.kafkaClient.subscribeToResponseOf(topic);
+      });
+
+      this.logger.log('Attempting to connect to Kafka...');
+      await this.kafkaClient.connect();
+      this.logger.log('✅ Kafka client connected successfully');
+    } catch (error) {
+      this.logger.error(`❌ Failed to connect to Kafka: ${error.message}`);
+      // Don't throw - allow app to continue without Kafka
+      this.logger.warn('Continuing without Kafka connection - some features may be limited');
+    }
   }
 
   async onModuleDestroy() {
-    await this.kafkaClient.close();
-    this.logger.log('Kafka client disconnected');
+    if (this.kafkaClient) {
+      try {
+        await this.kafkaClient.close();
+        this.logger.log('Kafka client disconnected');
+      } catch (error) {
+        this.logger.error(`Error disconnecting Kafka: ${error.message}`);
+      }
+    }
   }
 
+  // ==================== MESSAGE EMITTING ====================
+  
   async emit(topic: string, data: any, correlationId?: string): Promise<void> {
+    // Skip if Kafka is disabled
+    if (!this.kafkaClient) {
+      this.logger.debug(`Kafka disabled, skipping emit to ${topic}`);
+      return;
+    }
+
     try {
       const message = {
         ...data,
@@ -98,18 +137,26 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
         timestamp: Date.now().toString()
       };
 
-      this.logger.debug(`Emitting to topic ${topic}: ${JSON.stringify({ message, headers })}`);
+      this.logger.debug(`Emitting to topic ${topic}`);
       
       await this.kafkaClient.emit(topic, { value: message, headers }).toPromise();
     } catch (error) {
       this.logger.error(`Failed to emit to topic ${topic}: ${error.message}`);
       
-      // Send to Dead Letter Queue
-      await this.sendToDLQ(topic, data, error, correlationId);
+      // Try to send to DLQ if available
+      await this.sendToDLQ(topic, data, error, correlationId).catch(e => 
+        this.logger.error(`Failed to send to DLQ: ${e.message}`)
+      );
     }
   }
 
   async send(topic: string, data: any, correlationId?: string): Promise<any> {
+    // Skip if Kafka is disabled
+    if (!this.kafkaClient) {
+      this.logger.debug(`Kafka disabled, skipping send to ${topic}`);
+      return null;
+    }
+
     try {
       const message = {
         ...data,
@@ -123,7 +170,7 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
         timestamp: Date.now().toString()
       };
 
-      this.logger.debug(`Sending to topic ${topic}: ${JSON.stringify({ message, headers })}`);
+      this.logger.debug(`Sending to topic ${topic}`);
       
       return await this.kafkaClient.send(topic, { value: message, headers }).toPromise();
     } catch (error) {
@@ -134,7 +181,11 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  // ==================== DEAD LETTER QUEUE ====================
+  
   private async sendToDLQ(originalTopic: string, data: any, error: Error, correlationId?: string) {
+    if (!this.kafkaClient) return;
+
     try {
       await this.kafkaClient.emit(KAFKA_TOPICS.AD_DLQ, {
         value: {
@@ -153,11 +204,25 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  // ==================== UTILITIES ====================
+  
   private generateCorrelationId(): string {
     return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}-${Math.random().toString(36).substr(2, 9)}`;
   }
 
   getClient(): ClientKafka {
     return this.kafkaClient;
+  }
+
+  // ==================== HEALTH CHECK ====================
+  
+  async isConnected(): Promise<boolean> {
+    if (!this.kafkaClient) return false;
+    try {
+      // You can add a simple health check here
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
